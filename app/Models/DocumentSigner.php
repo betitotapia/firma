@@ -14,6 +14,7 @@ class DocumentSigner extends Model
     protected $fillable = [
         'document_id',
         'role',
+        'display_role',
         'sign_order',
         'name',
         'email',
@@ -32,7 +33,6 @@ class DocumentSigner extends Model
     | Relaciones
     |--------------------------------------------------------------------------
     */
-
     public function document()
     {
         return $this->belongsTo(Document::class);
@@ -43,7 +43,6 @@ class DocumentSigner extends Model
     | Helpers útiles
     |--------------------------------------------------------------------------
     */
-
     public function isSigned(): bool
     {
         return $this->status === 'signed';
@@ -62,5 +61,18 @@ class DocumentSigner extends Model
     public function isDirector(): bool
     {
         return $this->role === 'director';
+    }
+
+    public function getRoleLabelAttribute(): string
+    {
+        if (!empty($this->display_role)) {
+            return $this->display_role;
+        }
+
+        return match ($this->role) {
+            'director' => 'Patrón / Directivo',
+            'employee' => 'Trabajador',
+            default => 'Firmante',
+        };
     }
 }

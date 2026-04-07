@@ -38,18 +38,23 @@
 <body>
   <div class="wrap">
 
-    @php
-      $token = $token ?? request()->route('token');
-      $token_status = $token_status ?? 'active';
-      $otp_verified = (bool)($otp_verified ?? false);
-      $liveness_ok  = (bool)($liveness_ok ?? false);
+   @php
+    $token = $token ?? request()->route('token');
+    $token_status = $token_status ?? 'active';
+    $otp_verified = (bool)($otp_verified ?? false);
+    $liveness_ok = (bool)($liveness_ok ?? false);
+    $download_ready = (bool)($download_ready ?? false);
+    $download_label = $download_label ?? 'Descargar PDF';
 
-      $download_ready = (bool)($download_ready ?? false);
-      $download_label = $download_label ?? 'Descargar PDF';
-      $signerName = $signer->name ?? 'Firmante';
-      $signerRole = $signer->role ?? '';
-      $roleLabel = $signerRole === 'director' ? 'Patrón / Directivo' : ($signerRole === 'employee' ? 'Trabajador' : 'Firmante');
-    @endphp
+    $signerName = $signer->name ?? 'Firmante';
+    $signerRole = $signer->role ?? '';
+
+    $roleLabel = $signer->role_label
+        ?? ($signer->display_role
+            ?? ($signerRole === 'director'
+                ? 'Patrón / Directivo'
+                : ($signerRole === 'employee' ? 'Trabajador' : 'Firmante')));
+@endphp
 
     <div class="top">
       <div>

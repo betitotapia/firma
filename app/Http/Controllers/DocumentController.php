@@ -44,29 +44,35 @@ class DocumentController extends Controller
         return view('documents.create');
     }
 
-    
     public function store(Request $request)
 {
     $request->validate([
-        'title' => ['required','string','max:255'],
-        'recipient_name' => ['required','string','max:255'],
-        'recipient_email' => ['required','email','max:255'],
-        'pdf' => ['required','file','mimes:pdf','max:10240'],
-        'director_name'  => ['required','string','max:240'],
-        'director_email' => ['required','email','max:240','different:recipient_email'],
+        'title' => ['required', 'string', 'max:255'],
+        'recipient_name' => ['required', 'string', 'max:255'],
+        'recipient_email' => ['required', 'email', 'max:255'],
+        'recipient_display_role' => ['required', 'string', 'max:120'],
+        'pdf' => ['required', 'file', 'mimes:pdf', 'max:10240'],
+
+        'director_name' => ['required', 'string', 'max:240'],
+        'director_email' => ['required', 'email', 'max:240', 'different:recipient_email'],
+        'director_display_role' => ['required', 'string', 'max:120'],
     ]);
 
     if (!$request->hasFile('pdf') || !$request->file('pdf')->isValid()) {
-        return back()->withErrors(['pdf' => 'El archivo PDF no es válido o no se pudo subir.'])->withInput();
+        return back()
+            ->withErrors(['pdf' => 'El archivo PDF no es válido o no se pudo subir.'])
+            ->withInput();
     }
 
     $file = $request->file('pdf');
 
     \Storage::makeDirectory('contracts/original');
-
     $path = $file->store('contracts/original');
+
     if (!$path) {
-        return back()->withErrors(['pdf' => 'No se pudo guardar el PDF en storage.'])->withInput();
+        return back()
+            ->withErrors(['pdf' => 'No se pudo guardar el PDF en storage.'])
+            ->withInput();
     }
 
     $sha256 = hash_file('sha256', \Storage::path($path));
@@ -74,7 +80,7 @@ class DocumentController extends Controller
     $doc = \App\Models\Document::create([
         'title' => $request->title,
         'status' => 'draft',
-        'created_by_user_id' => auth()->id(), // ✅ AQUÍ el fix
+        'created_by_user_id' => auth()->id(),
     ]);
 
     $recipient = \App\Models\DocumentRecipient::create([
@@ -84,9 +90,10 @@ class DocumentController extends Controller
         'status' => 'pending',
     ]);
 
-        DocumentSigner::create([
+    DocumentSigner::create([
         'document_id' => $doc->id,
         'role' => 'employee',
+        'display_role' => $request->recipient_display_role,
         'sign_order' => 1,
         'name' => $request->recipient_name,
         'email' => $request->recipient_email,
@@ -96,6 +103,7 @@ class DocumentController extends Controller
     DocumentSigner::create([
         'document_id' => $doc->id,
         'role' => 'director',
+        'display_role' => $request->director_display_role,
         'sign_order' => 2,
         'name' => $request->director_name,
         'email' => $request->director_email,
@@ -123,7 +131,9 @@ class DocumentController extends Controller
         'version_id' => $version->id,
     ]);
 
-    return redirect()->route('documents.show', $doc)->with('ok', 'Contrato creado');
+    return redirect()
+        ->route('documents.show', $doc)
+        ->with('ok', 'Contrato creado');
 }
     public function show(Document $document)
     {
