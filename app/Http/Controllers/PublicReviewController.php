@@ -24,6 +24,7 @@ class PublicReviewController extends Controller
 
         $token_status = $tok->status;
         $otp_verified = (bool) $request->session()->get('otp_verified_'.$tok->id, false);
+        $signerCount = $document->signers()->count();
 
         $employeeSigned = $document->versions()->where('type', 'signed_employee')->exists();
         $finalSigned = $document->versions()->where('type', 'signed_final')->exists();
@@ -32,8 +33,8 @@ class PublicReviewController extends Controller
             ->where('signer_id', $signer->id)
             ->exists();
 
-        $canDownloadEmployee = $employeeSigned && in_array($signer->role, ['employee', 'director'], true);
-        $canDownloadFinal = $finalSigned && in_array($signer->role, ['director'], true);
+        $canDownloadEmployee = $employeeSigned && $signerCount > 1 && in_array($signer->role, ['employee', 'director'], true);
+        $canDownloadFinal = $finalSigned && ($signerCount === 1 || in_array($signer->role, ['director'], true));
 
         $download_ready = $canDownloadFinal || $canDownloadEmployee;
 
@@ -186,15 +187,12 @@ class PublicReviewController extends Controller
         $request->session()->forget('otp_expires_'.$tok->id);
 
         $signers = $this->getSigners($document);
-        $stage = $signer->role === 'employee' ? 'employee' : 'final';
+        $nextPending = DocumentSigner::where('document_id', $document->id)
+            ->where('status', 'pending')
+            ->orderBy('sign_order')
+            ->first();
 
-        if ($stage === 'final') {
-            $employee = collect($signers)->firstWhere('role', 'employee');
-
-            if (! $employee || $employee->status !== 'signed' || ! $employee->signature_path) {
-                return back()->withErrors(['signature' => 'Primero debe firmar el colaborador.']);
-            }
-        }
+        $stage = $nextPending ? 'employee' : 'final';
 
         $evidenceId = (string) Str::uuid();
         $payload = $this->buildEvidencePayload($document, $signers, $stage, $request, $tok, $evidenceId);
@@ -782,6 +780,7 @@ class PublicReviewController extends Controller
             if ($pageNo === $pageCount) {
                 $pageW = $size['width'];
                 $pageH = $size['height'];
+                $hasSecondSigner = (bool) $director;
 
                 $sigW = 55;
                 $ySig = $pageH * 0.74;
@@ -789,12 +788,22 @@ class PublicReviewController extends Controller
                 $xPatron = $pageW * 0.14;
                 $xTrab = $pageW * 0.58;
 
-                if ($directorSigFull && file_exists($directorSigFull)) {
-                    $pdf->Image($directorSigFull, $xPatron, $ySig, $sigW, 0, 'PNG');
-                }
+                if ($hasSecondSigner) {
+                    if ($directorSigFull && file_exists($directorSigFull)) {
+                        $pdf->Image($directorSigFull, $xPatron, $ySig, $sigW, 0, 'PNG');
+                    }
 
-                if ($employeeSigFull && file_exists($employeeSigFull)) {
-                    $pdf->Image($employeeSigFull, $xTrab, $ySig, $sigW, 0, 'PNG');
+                    if ($employeeSigFull && file_exists($employeeSigFull)) {
+                        $pdf->Image($employeeSigFull, $xTrab, $ySig, $sigW, 0, 'PNG');
+                    }
+                } else {
+                    $singleSigner = $employee ?? $director;
+                    $singleSigFull = $employeeSigFull ?: $directorSigFull;
+                    $xCenter = ($pageW - $sigW) / 2;
+
+                    if ($singleSigFull && file_exists($singleSigFull)) {
+                        $pdf->Image($singleSigFull, $xCenter, $ySig, $sigW, 0, 'PNG');
+                    }
                 }
 
                 $pdf->SetTextColor(40, 40, 40);
@@ -808,20 +817,32 @@ class PublicReviewController extends Controller
 
                 $pdf->SetFont('helvetica', '', 8);
 
-                $directorRoleLabel = $this->signerRoleLabel($director, 'EL PATRÓN');
-                $employeeRoleLabel = $this->signerRoleLabel($employee, 'EL TRABAJADOR');
+                if ($hasSecondSigner) {
+                    $directorRoleLabel = $this->signerRoleLabel($director, 'EL PATRÓN');
+                    $employeeRoleLabel = $this->signerRoleLabel($employee, 'EL TRABAJADOR');
 
-                $pdf->Line($xPatron, $yLine, $xPatron + $lineW, $yLine);
-                $pdf->SetXY($xPatron, $yName);
-                $pdf->MultiCell($sigW, 4, ($director?->name ?? '—'), 0, 'C', false);
-                $pdf->SetXY($xPatron, $yRole);
-                $pdf->MultiCell($sigW, 4, $directorRoleLabel, 0, 'C', false);
+                    $pdf->Line($xPatron, $yLine, $xPatron + $lineW, $yLine);
+                    $pdf->SetXY($xPatron, $yName);
+                    $pdf->MultiCell($sigW, 4, ($director?->name ?? '—'), 0, 'C', false);
+                    $pdf->SetXY($xPatron, $yRole);
+                    $pdf->MultiCell($sigW, 4, $directorRoleLabel, 0, 'C', false);
 
-                $pdf->Line($xTrab, $yLine, $xTrab + $lineW, $yLine);
-                $pdf->SetXY($xTrab, $yName);
-                $pdf->MultiCell($sigW, 4, ($employee?->name ?? '—'), 0, 'C', false);
-                $pdf->SetXY($xTrab, $yRole);
-                $pdf->MultiCell($sigW, 4, $employeeRoleLabel, 0, 'C', false);
+                    $pdf->Line($xTrab, $yLine, $xTrab + $lineW, $yLine);
+                    $pdf->SetXY($xTrab, $yName);
+                    $pdf->MultiCell($sigW, 4, ($employee?->name ?? '—'), 0, 'C', false);
+                    $pdf->SetXY($xTrab, $yRole);
+                    $pdf->MultiCell($sigW, 4, $employeeRoleLabel, 0, 'C', false);
+                } else {
+                    $singleSigner = $employee ?? $director;
+                    $singleRoleLabel = $this->signerRoleLabel($singleSigner, 'FIRMANTE');
+                    $xCenter = ($pageW - $sigW) / 2;
+
+                    $pdf->Line($xCenter, $yLine, $xCenter + $lineW, $yLine);
+                    $pdf->SetXY($xCenter, $yName);
+                    $pdf->MultiCell($sigW, 4, ($singleSigner?->name ?? '—'), 0, 'C', false);
+                    $pdf->SetXY($xCenter, $yRole);
+                    $pdf->MultiCell($sigW, 4, $singleRoleLabel, 0, 'C', false);
+                }
             }
         }
 
@@ -907,54 +928,87 @@ class PublicReviewController extends Controller
         $employeeRoleShort = $this->signerRoleLabel($employee, 'FIRMANTE 1');
         $directorRoleShort = $this->signerRoleLabel($director, 'FIRMANTE 2');
 
-        $pdf->SetXY($leftX, $imgY - 8);
-        $pdf->SetFont('helvetica', 'B', 9);
-        $pdf->Cell($imgW, 5, $employeeRoleShort.': '.($employee?->name ?? 'N/A'), 0, 1, 'L', false);
+        if ($director) {
+            $pdf->SetXY($leftX, $imgY - 8);
+            $pdf->SetFont('helvetica', 'B', 9);
+            $pdf->Cell($imgW, 5, $employeeRoleShort.': '.($employee?->name ?? 'N/A'), 0, 1, 'L', false);
 
-        $pdf->SetFont('helvetica', '', 9);
-        if ($empLive && $empLivePath && file_exists($empLivePath)) {
-            $this->drawContainedImage($pdf, $empLivePath, $leftX, $imgY, $imgW, $imgH, true);
+            $pdf->SetFont('helvetica', '', 9);
+            if ($empLive && $empLivePath && file_exists($empLivePath)) {
+                $this->drawContainedImage($pdf, $empLivePath, $leftX, $imgY, $imgW, $imgH, true);
 
-            $pdf->SetXY($leftX, $imgY + $imgH + 2);
-            $pdf->MultiCell(
-                $imgW,
-                4.2,
-                "Challenge: {$empLive->challenge}\n"
-                ."Selfie-SHA256: {$empLive->sha256}\n"
-                .'Capturada: '.($empLive->captured_at?->format('Y-m-d H:i:s') ?? '—'),
-                0,
-                'L',
-                false
-            );
+                $pdf->SetXY($leftX, $imgY + $imgH + 2);
+                $pdf->MultiCell(
+                    $imgW,
+                    4.2,
+                    "Challenge: {$empLive->challenge}\n"
+                    ."Selfie-SHA256: {$empLive->sha256}\n"
+                    .'Capturada: '.($empLive->captured_at?->format('Y-m-d H:i:s') ?? '—'),
+                    0,
+                    'L',
+                    false
+                );
+            } else {
+                $pdf->Rect($leftX, $imgY, $imgW, $imgH);
+                $pdf->SetXY($leftX + 3, $imgY + 25);
+                $pdf->MultiCell($imgW - 6, 5, 'Sin selfie registrada.', 0, 'C', false);
+            }
+
+            $pdf->SetXY($rightX, $imgY - 8);
+            $pdf->SetFont('helvetica', 'B', 9);
+            $pdf->Cell($imgW, 5, $directorRoleShort.': '.($director?->name ?? 'N/A'), 0, 1, 'L', false);
+
+            $pdf->SetFont('helvetica', '', 9);
+            if ($dirLive && $dirLivePath && file_exists($dirLivePath)) {
+                $this->drawContainedImage($pdf, $dirLivePath, $rightX, $imgY, $imgW, $imgH, true);
+
+                $pdf->SetXY($rightX, $imgY + $imgH + 2);
+                $pdf->MultiCell(
+                    $imgW,
+                    4.2,
+                    "Challenge: {$dirLive->challenge}\n"
+                    ."Selfie-SHA256: {$dirLive->sha256}\n"
+                    .'Capturada: '.($dirLive->captured_at?->format('Y-m-d H:i:s') ?? '—'),
+                    0,
+                    'L',
+                    false
+                );
+            } else {
+                $pdf->Rect($rightX, $imgY, $imgW, $imgH);
+                $pdf->SetXY($rightX + 3, $imgY + 25);
+                $pdf->MultiCell($imgW - 6, 5, 'Sin selfie registrada.', 0, 'C', false);
+            }
         } else {
-            $pdf->Rect($leftX, $imgY, $imgW, $imgH);
-            $pdf->SetXY($leftX + 3, $imgY + 25);
-            $pdf->MultiCell($imgW - 6, 5, 'Sin selfie registrada.', 0, 'C', false);
-        }
+            $singleSigner = $employee ?? $director;
+            $singleLive = $empLive ?? $dirLive;
+            $singleLivePath = $empLivePath ?: $dirLivePath;
+            $singleRoleShort = $this->signerRoleLabel($singleSigner, 'FIRMANTE 1');
+            $singleX = ($pageW - $imgW) / 2;
 
-        $pdf->SetXY($rightX, $imgY - 8);
-        $pdf->SetFont('helvetica', 'B', 9);
-        $pdf->Cell($imgW, 5, $directorRoleShort.': '.($director?->name ?? 'N/A'), 0, 1, 'L', false);
+            $pdf->SetXY($singleX, $imgY - 8);
+            $pdf->SetFont('helvetica', 'B', 9);
+            $pdf->Cell($imgW, 5, $singleRoleShort.': '.($singleSigner?->name ?? 'N/A'), 0, 1, 'L', false);
 
-        $pdf->SetFont('helvetica', '', 9);
-        if ($dirLive && $dirLivePath && file_exists($dirLivePath)) {
-            $this->drawContainedImage($pdf, $dirLivePath, $rightX, $imgY, $imgW, $imgH, true);
+            $pdf->SetFont('helvetica', '', 9);
+            if ($singleLive && $singleLivePath && file_exists($singleLivePath)) {
+                $this->drawContainedImage($pdf, $singleLivePath, $singleX, $imgY, $imgW, $imgH, true);
 
-            $pdf->SetXY($rightX, $imgY + $imgH + 2);
-            $pdf->MultiCell(
-                $imgW,
-                4.2,
-                "Challenge: {$dirLive->challenge}\n"
-                ."Selfie-SHA256: {$dirLive->sha256}\n"
-                .'Capturada: '.($dirLive->captured_at?->format('Y-m-d H:i:s') ?? '—'),
-                0,
-                'L',
-                false
-            );
-        } else {
-            $pdf->Rect($rightX, $imgY, $imgW, $imgH);
-            $pdf->SetXY($rightX + 3, $imgY + 25);
-            $pdf->MultiCell($imgW - 6, 5, 'Sin selfie registrada.', 0, 'C', false);
+                $pdf->SetXY($singleX, $imgY + $imgH + 2);
+                $pdf->MultiCell(
+                    $imgW,
+                    4.2,
+                    "Challenge: {$singleLive->challenge}\n"
+                    ."Selfie-SHA256: {$singleLive->sha256}\n"
+                    .'Capturada: '.($singleLive->captured_at?->format('Y-m-d H:i:s') ?? '—'),
+                    0,
+                    'L',
+                    false
+                );
+            } else {
+                $pdf->Rect($singleX, $imgY, $imgW, $imgH);
+                $pdf->SetXY($singleX + 3, $imgY + 25);
+                $pdf->MultiCell($imgW - 6, 5, 'Sin selfie registrada.', 0, 'C', false);
+            }
         }
 
         $pdf->Output($outFullPath, 'F');

@@ -47,15 +47,16 @@ class DocumentController extends Controller
     public function store(Request $request)
 {
     $request->validate([
+        'signer_count' => ['required', 'integer', 'in:1,2'],
         'title' => ['required', 'string', 'max:255'],
         'recipient_name' => ['required', 'string', 'max:255'],
         'recipient_email' => ['required', 'email', 'max:255'],
         'recipient_display_role' => ['required', 'string', 'max:120'],
         'pdf' => ['required', 'file', 'mimes:pdf', 'max:10240'],
 
-        'director_name' => ['required', 'string', 'max:240'],
-        'director_email' => ['required', 'email', 'max:240', 'different:recipient_email'],
-        'director_display_role' => ['required', 'string', 'max:120'],
+        'director_name' => ['required_if:signer_count,2', 'nullable', 'string', 'max:240'],
+        'director_email' => ['required_if:signer_count,2', 'nullable', 'email', 'max:240', 'different:recipient_email'],
+        'director_display_role' => ['required_if:signer_count,2', 'nullable', 'string', 'max:120'],
     ]);
 
     if (!$request->hasFile('pdf') || !$request->file('pdf')->isValid()) {
@@ -90,25 +91,33 @@ class DocumentController extends Controller
         'status' => 'pending',
     ]);
 
-    DocumentSigner::create([
-        'document_id' => $doc->id,
-        'role' => 'employee',
-        'display_role' => $request->recipient_display_role,
-        'sign_order' => 1,
-        'name' => $request->recipient_name,
-        'email' => $request->recipient_email,
-        'status' => 'pending',
-    ]);
+    $signers = [
+        [
+            'document_id' => $doc->id,
+            'role' => 'employee',
+            'display_role' => $request->recipient_display_role,
+            'sign_order' => 1,
+            'name' => $request->recipient_name,
+            'email' => $request->recipient_email,
+            'status' => 'pending',
+        ],
+    ];
 
-    DocumentSigner::create([
-        'document_id' => $doc->id,
-        'role' => 'director',
-        'display_role' => $request->director_display_role,
-        'sign_order' => 2,
-        'name' => $request->director_name,
-        'email' => $request->director_email,
-        'status' => 'pending',
-    ]);
+    if ((int) $request->input('signer_count') === 2) {
+        $signers[] = [
+            'document_id' => $doc->id,
+            'role' => 'director',
+            'display_role' => $request->director_display_role,
+            'sign_order' => 2,
+            'name' => $request->director_name,
+            'email' => $request->director_email,
+            'status' => 'pending',
+        ];
+    }
+
+    foreach ($signers as $signerData) {
+        DocumentSigner::create($signerData);
+    }
 
     $version = \App\Models\DocumentVersion::create([
         'document_id' => $doc->id,

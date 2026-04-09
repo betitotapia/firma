@@ -14,6 +14,11 @@ class Document extends Model
         return $this->hasOne(DocumentRecipient::class);
     }
 
+    public function signers()
+    {
+        return $this->hasMany(DocumentSigner::class);
+    }
+
     public function versions()
     {
         return $this->hasMany(DocumentVersion::class);
