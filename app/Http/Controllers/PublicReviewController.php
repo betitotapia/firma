@@ -12,9 +12,12 @@ use App\Models\DocumentToken;
 use App\Models\DocumentVersion;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use setasign\Fpdi\PdfParser\CrossReference\CrossReferenceException;
 
 class PublicReviewController extends Controller
 {
@@ -172,159 +175,187 @@ class PublicReviewController extends Controller
 
         $now = now();
 
-        $signer->signature_path = $sigPath;
-        $signer->status = 'signed';
-        $signer->signed_at = $now;
-        $signer->signed_ip = $request->ip();
-        $signer->save();
+        try {
+            $result = DB::transaction(function () use ($request, $tok, $document, $signer, $sigPath, $now) {
+                $signer->signature_path = $sigPath;
+                $signer->status = 'signed';
+                $signer->signed_at = $now;
+                $signer->signed_ip = $request->ip();
+                $signer->save();
 
-        $tok->status = 'consumed';
-        $tok->consumed_at = $now;
-        $tok->save();
+                $tok->status = 'consumed';
+                $tok->consumed_at = $now;
+                $tok->save();
+
+                $signers = $this->getSigners($document);
+                $nextPending = DocumentSigner::where('document_id', $document->id)
+                    ->where('status', 'pending')
+                    ->orderBy('sign_order')
+                    ->first();
+
+                $stage = $nextPending ? 'employee' : 'final';
+
+                $evidenceId = (string) Str::uuid();
+                $payload = $this->buildEvidencePayload($document, $signers, $stage, $request, $tok, $evidenceId);
+                $canonical = $this->canonicalJson($payload);
+                $evidenceSha = hash('sha256', $canonical);
+
+                [$signedPath, $signedFullPath, $signedSha] = $this->buildSignedPdf(
+                    $document,
+                    $signers,
+                    $stage,
+                    $request,
+                    $evidenceId,
+                    $evidenceSha
+                );
+
+                $evidenceUrl = route('evidence.public.show', ['evidenceId' => $evidenceId]);
+
+                $employee = collect($signers)->firstWhere('role', 'employee');
+                $director = collect($signers)->firstWhere('role', 'director');
+
+                if ($stage === 'employee') {
+                    if ($employee) {
+                        $this->emailSignedPdfTo(
+                            toList: [
+                                [
+                                    'email' => $employee->email,
+                                    'name' => $employee->name,
+                                ],
+                            ],
+                            subject: 'Contrato firmado (trabajador) - copia',
+                            title: $document->title,
+                            stageLabel: 'Firma del trabajador (PDF intermedio)',
+                            signedFullPath: $signedFullPath,
+                            fileName: 'contrato_intermedio_'.$document->id.'.pdf',
+                            evidenceUrl: $evidenceUrl
+                        );
+                    }
+                }
+
+                if ($stage === 'final') {
+                    $to = [];
+
+                    if ($director) {
+                        $to[] = ['email' => $director->email, 'name' => $director->name];
+                    }
+
+                    if ($employee) {
+                        $to[] = ['email' => $employee->email, 'name' => $employee->name];
+                    }
+
+                    if (! empty($to)) {
+                        $this->emailSignedPdfTo(
+                            toList: $to,
+                            subject: 'Contrato firmado (final) - copia',
+                            title: $document->title,
+                            stageLabel: 'Contrato final firmado por ambas partes',
+                            signedFullPath: $signedFullPath,
+                            fileName: 'contrato_final_'.$document->id.'.pdf',
+                            evidenceUrl: $evidenceUrl
+                        );
+                    }
+                }
+
+                $versionType = $stage === 'employee' ? 'signed_employee' : 'signed_final';
+
+                $version = DocumentVersion::create([
+                    'document_id' => $document->id,
+                    'type' => $versionType,
+                    'storage_disk' => config('filesystems.default', 'local'),
+                    'storage_path' => $signedPath,
+                    'original_filename' => $versionType.'_doc_'.$document->id.'.pdf',
+                    'mime_type' => 'application/pdf',
+                    'size_bytes' => filesize($signedFullPath) ?: 0,
+                ]);
+
+                DocumentEvidence::create([
+                    'document_id' => $document->id,
+                    'document_version_id' => $version->id,
+                    'stage' => $stage,
+                    'evidence_id' => $evidenceId,
+                    'evidence_sha256' => $evidenceSha,
+                    'evidence_json' => $canonical,
+                ]);
+
+                $hashRow = DocumentHash::firstOrCreate(['document_id' => $document->id]);
+                $hashRow->signed_sha256 = $signedSha;
+                $hashRow->save();
+
+                $next = DocumentSigner::where('document_id', $document->id)
+                    ->where('status', 'pending')
+                    ->orderBy('sign_order')
+                    ->first();
+
+                if ($next) {
+                    $rawNextToken = $this->createSignerToken($document, $next, 72);
+
+                    DocumentEvent::log($document->id, 'token_created', $request, [
+                        'signer_id' => $next->id,
+                        'signer_email' => $next->email,
+                    ]);
+
+                    $link = route('public.review', ['token' => $rawNextToken]);
+
+                    Mail::raw(
+                        "Hola {$next->name},\n\nTienes un contrato pendiente por firmar.\n\nLink:\n{$link}\n\n",
+                        function ($m) use ($next) {
+                            $m->to($next->email, $next->name)->subject('Firma pendiente de contrato');
+                        }
+                    );
+
+                    $document->status = 'pending_next_signature';
+                    $document->save();
+                } else {
+                    $document->status = 'signed';
+                    $document->save();
+                }
+
+                DocumentEvent::log($document->id, 'signed_in_app', $request, [
+                    'token_id' => $tok->id,
+                    'signer_id' => $signer->id,
+                    'stage' => $stage,
+                    'signed_version_id' => $version->id,
+                    'signed_sha256' => $signedSha,
+                    'signature_path' => $sigPath,
+                    'evidence_id' => $evidenceId,
+                    'evidence_sha256' => $evidenceSha,
+                ]);
+
+                return [
+                    'stage' => $stage,
+                ];
+            });
+        } catch (CrossReferenceException $e) {
+            Storage::delete($sigPath);
+
+            Log::warning('PDF no compatible con parser FPDI libre', [
+                'document_id' => $document->id,
+                'token_id' => $tok->id,
+                'signer_id' => $signer->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return back()->withInput()->withErrors([
+                'document' => 'No pudimos procesar el PDF porque usa una compresión o estructura no compatible con el sistema actual. '
+                    .'Para subir un PDF válido: (1) vuelve a exportarlo como PDF estándar/PDF 1.4, '
+                    .'(2) quita contraseña o restricciones de edición/impresión, '
+                    .'(3) desactiva la opción de "optimizar" o "comprimir" PDF en la herramienta que uses, '
+                    .'y (4) cárgalo nuevamente.',
+            ]);
+        } catch (\Throwable $e) {
+            Storage::delete($sigPath);
+            throw $e;
+        }
 
         $request->session()->forget('otp_verified_'.$tok->id);
         $request->session()->forget('otp_code_hash_'.$tok->id);
         $request->session()->forget('otp_expires_'.$tok->id);
 
-        $signers = $this->getSigners($document);
-        $nextPending = DocumentSigner::where('document_id', $document->id)
-            ->where('status', 'pending')
-            ->orderBy('sign_order')
-            ->first();
-
-        $stage = $nextPending ? 'employee' : 'final';
-
-        $evidenceId = (string) Str::uuid();
-        $payload = $this->buildEvidencePayload($document, $signers, $stage, $request, $tok, $evidenceId);
-        $canonical = $this->canonicalJson($payload);
-        $evidenceSha = hash('sha256', $canonical);
-
-        [$signedPath, $signedFullPath, $signedSha] = $this->buildSignedPdf(
-            $document,
-            $signers,
-            $stage,
-            $request,
-            $evidenceId,
-            $evidenceSha
-        );
-
-        $evidenceUrl = route('evidence.public.show', ['evidenceId' => $evidenceId]);
-
-        $employee = collect($signers)->firstWhere('role', 'employee');
-        $director = collect($signers)->firstWhere('role', 'director');
-
-        if ($stage === 'employee') {
-            if ($employee) {
-                $this->emailSignedPdfTo(
-                    toList: [
-                        [
-                            'email' => $employee->email,
-                            'name' => $employee->name,
-                        ],
-                    ],
-                    subject: 'Contrato firmado (trabajador) - copia',
-                    title: $document->title,
-                    stageLabel: 'Firma del trabajador (PDF intermedio)',
-                    signedFullPath: $signedFullPath,
-                    fileName: 'contrato_intermedio_'.$document->id.'.pdf',
-                    evidenceUrl: $evidenceUrl
-                );
-            }
-        }
-
-        if ($stage === 'final') {
-            $to = [];
-
-            if ($director) {
-                $to[] = ['email' => $director->email, 'name' => $director->name];
-            }
-
-            if ($employee) {
-                $to[] = ['email' => $employee->email, 'name' => $employee->name];
-            }
-
-            if (! empty($to)) {
-                $this->emailSignedPdfTo(
-                    toList: $to,
-                    subject: 'Contrato firmado (final) - copia',
-                    title: $document->title,
-                    stageLabel: 'Contrato final firmado por ambas partes',
-                    signedFullPath: $signedFullPath,
-                    fileName: 'contrato_final_'.$document->id.'.pdf',
-                    evidenceUrl: $evidenceUrl
-                );
-            }
-        }
-
-        $versionType = $stage === 'employee' ? 'signed_employee' : 'signed_final';
-
-        $version = DocumentVersion::create([
-            'document_id' => $document->id,
-            'type' => $versionType,
-            'storage_disk' => config('filesystems.default', 'local'),
-            'storage_path' => $signedPath,
-            'original_filename' => $versionType.'_doc_'.$document->id.'.pdf',
-            'mime_type' => 'application/pdf',
-            'size_bytes' => filesize($signedFullPath) ?: 0,
-        ]);
-
-        DocumentEvidence::create([
-            'document_id' => $document->id,
-            'document_version_id' => $version->id,
-            'stage' => $stage,
-            'evidence_id' => $evidenceId,
-            'evidence_sha256' => $evidenceSha,
-            'evidence_json' => $canonical,
-        ]);
-
-        $hashRow = DocumentHash::firstOrCreate(['document_id' => $document->id]);
-        $hashRow->signed_sha256 = $signedSha;
-        $hashRow->save();
-
-        $next = DocumentSigner::where('document_id', $document->id)
-            ->where('status', 'pending')
-            ->orderBy('sign_order')
-            ->first();
-
-        if ($next) {
-            $rawNextToken = $this->createSignerToken($document, $next, 72);
-
-            DocumentEvent::log($document->id, 'token_created', $request, [
-                'signer_id' => $next->id,
-                'signer_email' => $next->email,
-            ]);
-
-            $link = route('public.review', ['token' => $rawNextToken]);
-
-            Mail::raw(
-                "Hola {$next->name},\n\nTienes un contrato pendiente por firmar.\n\nLink:\n{$link}\n\n",
-                function ($m) use ($next) {
-                    $m->to($next->email, $next->name)->subject('Firma pendiente de contrato');
-                }
-            );
-
-            $document->status = 'pending_next_signature';
-            $document->save();
-        } else {
-            $document->status = 'signed';
-            $document->save();
-        }
-
-        DocumentEvent::log($document->id, 'signed_in_app', $request, [
-            'token_id' => $tok->id,
-            'signer_id' => $signer->id,
-            'stage' => $stage,
-            'signed_version_id' => $version->id,
-            'signed_sha256' => $signedSha,
-            'signature_path' => $sigPath,
-            'evidence_id' => $evidenceId,
-            'evidence_sha256' => $evidenceSha,
-        ]);
-
         return redirect()->route('public.review', ['token' => $token])
             ->with(
                 'ok',
-                $stage === 'employee'
+                $result['stage'] === 'employee'
                     ? 'Firma registrada. Se generó el PDF intermedio.'
                     : 'Firma registrada. Se generó el PDF final.'
             );

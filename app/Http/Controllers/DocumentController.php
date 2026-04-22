@@ -13,6 +13,8 @@ use App\Models\DocumentEvent;
 use App\Models\DocumentHash;
 use Carbon\Carbon;
 use App\Models\DocumentSigner;
+use setasign\Fpdi\PdfParser\CrossReference\CrossReferenceException;
+use setasign\Fpdi\Tcpdf\Fpdi;
 
 
 class DocumentController extends Controller
@@ -66,6 +68,20 @@ class DocumentController extends Controller
     }
 
     $file = $request->file('pdf');
+
+    $uploadedFullPath = $file->getRealPath();
+
+    if (! $uploadedFullPath || ! $this->isPdfSupportedByFpdi($uploadedFullPath)) {
+        return back()
+            ->withErrors([
+                'pdf' => 'Este PDF no es compatible con el sistema de firma. '
+                    .'Para subir un PDF admitido: (1) Abre el pdf en tu explorador (chrome o edge), '
+                    .'(2) Dale click en Imprimir, '
+                    .'(3) Guardalo como PDF, '
+                    .'y (4) vuelve a cargar el archivo.',
+            ])
+            ->withInput();
+    }
 
     \Storage::makeDirectory('contracts/original');
     $path = $file->store('contracts/original');
@@ -144,6 +160,21 @@ class DocumentController extends Controller
         ->route('documents.show', $doc)
         ->with('ok', 'Contrato creado');
 }
+
+    private function isPdfSupportedByFpdi(string $fullPath): bool
+    {
+        try {
+            $pdf = new Fpdi();
+            $pdf->setSourceFile($fullPath);
+
+            return true;
+        } catch (CrossReferenceException) {
+            return false;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
     public function show(Document $document)
     {
         $document->load(['recipient','versions','tokens','events' => function($q){ $q->latest('occurred_at'); }]);
